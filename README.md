@@ -514,6 +514,62 @@ Connect any local model with an OpenAI-compatible API (Ollama, llama-server, LM 
 
 The wrapper registers with the server, watches for @mentions, reads recent chat context, calls your model's `/v1/chat/completions` endpoint, and posts the response back. `config.local.toml` is gitignored so your local endpoints stay out of the repo.
 
+### A2A remote agents (A2A 1.0 JSON-RPC)
+
+Connect a remote agent that speaks the A2A 1.0 JSON-RPC wire format
+(`SendMessage` / `GetTask`). It appears in the room like any other agent —
+mention `@remote` and the reply comes back into chat. The existing CLI/API
+agent paths are unchanged.
+
+1. Install the optional extras into the project venv (Python >= 3.11):
+   ```bash
+   python -m pip install -r requirements-a2a.txt
+   # or: uv pip install -r requirements-a2a.txt
+   ```
+
+2. Add to `config.local.toml`:
+   ```toml
+   [agents.remote]
+   type = "a2a"
+   rpc_url = "http://127.0.0.1:9000/rpc"
+   label = "Remote"
+   color = "#abcdef"
+   # api_key_env = "REMOTE_A2A_KEY"   # optional: env var with the bearer token
+   # allow_lan = true                 # only for RFC1918/ULA numeric endpoints
+   # request_timeout = 30
+   # total_timeout = 60
+   # max_polls = 15
+   # poll_interval = 2
+   ```
+
+3. Start both processes:
+   ```bash
+   python run.py                    # the chat server
+   python wrapper_api.py remote     # separate terminal
+   ```
+   Then mention `@remote` in the room.
+
+Scope and limitations:
+
+- **A2A 1.0 JSON-RPC only** — not the 0.3 draft. Explicit RPC endpoint
+  only: no agent-card discovery, no streaming, no push notifications, no
+  gRPC, no public-DNS endpoints.
+- API keys are env-only (`api_key_env`); never stored in config.
+- Loopback is allowed by default. LAN requires `allow_lan = true` (an
+  actual boolean) and a **numeric** RFC1918 (IPv4) or ULA (IPv6) address.
+  LAN over plain HTTP is unencrypted — prefer HTTPS or a trusted network.
+- Context is tracked per channel. A paused task (input-required or
+  auth-required) is resumed by the next message in that channel; other
+  states start fresh.
+- Failed requests are **not** auto-retried; there is no durable
+  exactly-once promise. The wrapper's existing queue/restart semantics are
+  unchanged.
+- Bounded polling (`max_polls` / `total_timeout`) may stop the local wait
+  without cancelling the remote task.
+- Verified against mock/synthetic A2A servers and a live in-room human
+  mention round-trip. This is not a proof of interoperability with a live
+  third-party model agent.
+
 ### MiniMax (cloud API)
 
 [MiniMax](https://platform.minimax.io) is a built-in cloud API agent. It uses the MiniMax-M3 model via MiniMax's OpenAI-compatible endpoint. To use it:

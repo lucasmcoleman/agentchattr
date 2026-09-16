@@ -52,3 +52,26 @@
 # label = "MiniMax"
 # api_key_env = "MINIMAX_API_KEY"
 # temperature = 1.0
+
+# --- Example: Remote agent over A2A 1.0 JSON-RPC ---
+# Type "a2a" routes this wrapper through the A2A 1.0 JSON-RPC transport
+# (SendMessage/GetTask) instead of OpenAI-compatible chat completions.
+# Requires the optional extras: python -m pip install -r requirements-a2a.txt
+# Only explicit RPC endpoints are supported — no agent-card discovery, no
+# streaming, no push notifications, no gRPC. API keys are env-only.
+#
+# [agents.remote]
+# type = "a2a"                                  # required — A2A 1.0 JSON-RPC transport
+# rpc_url = "http://127.0.0.1:9000/rpc"         # explicit RPC endpoint (no discovery)
+# label = "Remote"                               # display name
+# color = "#abcdef"                              # status pill color in chat UI
+# # api_key_env = "REMOTE_A2A_KEY"              # optional: env var containing the bearer token
+# # allow_lan = true                             # required for RFC1918/ULA (numeric-only) endpoints; loopback works without it
+# # request_timeout = 30                         # per-HTTP-request timeout (seconds)
+# # total_timeout = 60                           # overall send budget (seconds)
+# # max_polls = 15                               # hard cap on GetTask polls
+# # poll_interval = 2                            # delay between GetTask polls (seconds)
+#
+# Note: LAN over plain HTTP is unencrypted — prefer HTTPS or a trusted
+# network. allow_lan must be an actual boolean true; only numeric
+# RFC1918 (IPv4) / ULA (IPv6) addresses are accepted, never DNS names.

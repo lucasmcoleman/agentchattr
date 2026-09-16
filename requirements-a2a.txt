@@ -1,0 +1,6 @@
+# Optional dependency for A2A (Agent-to-Agent) transport.
+# Baseline app works WITHOUT these; install only when A2A is configured.
+# Pinned to the version verified against the official SDK wire format
+# (SendMessage/GetTask JSON-RPC methods, protobuf parts + SendMessageResponse wrapper).
+a2a-sdk==1.1.2
+httpx>=0.28,<1.0

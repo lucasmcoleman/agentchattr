@@ -1,12 +1,21 @@
-"""API agent wrapper — bridges the chat room to an OpenAI-compatible endpoint.
+"""API/A2A agent wrapper — bridges the chat room to an OpenAI-compatible
+endpoint or a remote A2A 1.0 JSON-RPC agent.
 
 Usage:
     python wrapper_api.py qwen
     python wrapper_api.py my-local-model
+    python wrapper_api.py remote
 
-For local models (Ollama, llama-server, LM Studio, etc.) that expose an
-OpenAI-compatible /v1/chat/completions endpoint but have no CLI to inject
-keystrokes into.
+Two transports, selected by the agent's ``type`` in config:
+
+  * type = "api" — local models (Ollama, llama-server, LM Studio, etc.)
+    exposing an OpenAI-compatible /v1/chat/completions endpoint with no
+    CLI to inject keystrokes into.
+  * type = "a2a" — remote agents speaking A2A 1.0 JSON-RPC
+    (SendMessage/GetTask) at an explicit ``rpc_url`` (loopback by
+    default; LAN requires allow_lan = true with a numeric RFC1918/ULA
+    address). Requires the optional extras in requirements-a2a.txt.
+    API keys are env-only; failed sends are not auto-retried.
 
 How it works:
   1. Loads config (config.toml + config.local.toml).
@@ -14,7 +23,8 @@ How it works:
   3. Starts a heartbeat thread (same pattern as wrapper.py).
   4. Polls the queue file for @mentions.
   5. On trigger: reads recent chat context, formats into OpenAI messages,
-     POSTs to the model's /v1/chat/completions, sends reply via POST /api/send.
+     POSTs to the model's /v1/chat/completions (or routes through the
+     A2A adapter for type "a2a"), sends reply via POST /api/send.
   6. On exit: deregisters cleanly.
 """
 
@@ -38,6 +48,12 @@ def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
     return headers
 
 
+def selectable_agents(config: dict) -> list[str]:
+    """Agent names this wrapper can run: type 'api' or 'a2a'."""
+    agents = config.get("agents", {})
+    return [n for n in agents if agents[n].get("type") in ("api", "a2a")]
+
+
 def main():
     from config_loader import apply_cli_overrides, load_config
     from wrapper import _register_instance
@@ -48,19 +64,21 @@ def main():
     apply_cli_overrides()
     config = load_config(ROOT)
     agent_names = list(config.get("agents", {}).keys())
-    api_agents = [n for n in agent_names if config["agents"][n].get("type") == "api"]
+    api_agents = selectable_agents(config)
 
     if not api_agents:
-        print("  No API agents found in config.\n")
+        print("  No API or A2A agents found in config.\n")
         print("  To add one, copy the example config:")
         print("    cp config.local.toml.example config.local.toml")
-        print("  Then uncomment and edit an [agents.NAME] section (set type = \"api\").")
+        print("  Then uncomment and edit an [agents.NAME] section, setting")
+        print("  type = \"api\" (OpenAI-compatible endpoint) or type = \"a2a\"")
+        print("  (A2A 1.0 JSON-RPC with rpc_url; extras in requirements-a2a.txt).")
         print("  Finally: python wrapper_api.py <name>")
         sys.exit(1)
 
-    parser = argparse.ArgumentParser(description="API agent wrapper for OpenAI-compatible endpoints")
+    parser = argparse.ArgumentParser(description="API/A2A agent wrapper (OpenAI-compatible endpoints or A2A 1.0 JSON-RPC)")
     parser.add_argument("agent", choices=api_agents,
-                        help=f"API agent to run ({', '.join(api_agents)})")
+                        help=f"API or A2A agent to run ({', '.join(api_agents)})")
     parser.add_argument("--label", type=str, default=None, help="Custom display label")
     # Per-project isolation flags (consumed by apply_cli_overrides above;
     # listed here so --help shows them and argparse doesn't error on them).
@@ -77,22 +95,40 @@ def main():
     data_dir = ROOT / config.get("server", {}).get("data_dir", "./data")
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Model API config
-    base_url = agent_cfg.get("base_url", "").rstrip("/")
-    if not base_url:
-        print(f"  Error: [agents.{agent}] must have base_url (e.g. http://localhost:8189/v1)")
-        sys.exit(1)
-    model = agent_cfg.get("model", "")
-    api_key_env = agent_cfg.get("api_key_env", "")
-    api_key = os.environ.get(api_key_env, "") if api_key_env else ""
-    temperature = agent_cfg.get("temperature")
-    if temperature is not None:
-        temperature = float(temperature)
-        # Clamp: some providers (e.g. MiniMax) require temperature in (0.0, 1.0]
-        if temperature <= 0:
-            temperature = 0.01
-        if temperature > 2.0:
-            temperature = 2.0
+    is_a2a = agent_cfg.get("type") == "a2a"
+    a2a_adapter = None
+    if is_a2a:
+        # A2A transport: lazy import + construct + validate BEFORE registration.
+        try:
+            from a2a_room import A2ARoomAdapter
+            a2a_adapter = A2ARoomAdapter(agent_cfg)
+            a2a_adapter.validate()
+        except Exception as exc:
+            print(f"  Error: A2A agent '{agent}' is not usable: {exc}")
+            print("  Check rpc_url/api_key_env in config (see requirements-a2a.txt).")
+            sys.exit(1)
+        rpc_url = agent_cfg.get("rpc_url", "")
+        model = ""
+        temperature = None
+        base_url = ""
+        api_key = ""
+    else:
+        # Model API config
+        base_url = agent_cfg.get("base_url", "").rstrip("/")
+        if not base_url:
+            print(f"  Error: [agents.{agent}] must have base_url (e.g. http://localhost:8189/v1)")
+            sys.exit(1)
+        model = agent_cfg.get("model", "")
+        api_key_env = agent_cfg.get("api_key_env", "")
+        api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+        temperature = agent_cfg.get("temperature")
+        if temperature is not None:
+            temperature = float(temperature)
+            # Clamp: some providers (e.g. MiniMax) require temperature in (0.0, 1.0]
+            if temperature <= 0:
+                temperature = 0.01
+            if temperature > 2.0:
+                temperature = 2.0
     context_messages = int(agent_cfg.get("context_messages", 20))
     system_prompt = agent_cfg.get("system_prompt",
         f"You are {agent_cfg.get('label', agent)}, a helpful AI assistant participating "
@@ -224,8 +260,10 @@ def main():
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
 
-    # Call OpenAI-compatible chat completions API
-    def call_model(messages):
+    # Call OpenAI-compatible chat completions API (or A2A adapter)
+    def call_model(messages, channel="general"):
+        if is_a2a:
+            return a2a_adapter.send(messages, channel)
         url = f"{base_url}/chat/completions"
         payload = {"messages": messages}
         if model:
@@ -284,7 +322,7 @@ def main():
             messages = format_messages(chat_msgs)
             print(f"  [{channel}] Calling model with {len(messages)} messages...")
 
-            response = call_model(messages)
+            response = call_model(messages, channel=channel)
             response = response.strip()
             if not response:
                 return
@@ -308,10 +346,14 @@ def main():
     if queue_file.exists():
         queue_file.write_text("", "utf-8")
 
-    print(f"\n  === {agent_cfg.get('label', agent)} API Wrapper ===")
-    print(f"  Model endpoint: {base_url}/chat/completions")
-    if model:
-        print(f"  Model: {model}")
+    if is_a2a:
+        print(f"\n  === {agent_cfg.get('label', agent)} A2A Wrapper ===")
+        print(f"  A2A 1.0 endpoint: {rpc_url}")
+    else:
+        print(f"\n  === {agent_cfg.get('label', agent)} API Wrapper ===")
+        print(f"  Model endpoint: {base_url}/chat/completions")
+        if model:
+            print(f"  Model: {model}")
     print(f"  @{name} mentions trigger model calls")
     print(f"  Ctrl+C to stop\n")
 
