@@ -1,3 +1,4 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
 mcp>=1.0,<2.0  # v2 removes mcp.server.fastmcp (issue #85)
+argon2-cffi>=23.1  # built-in login (auth.py)

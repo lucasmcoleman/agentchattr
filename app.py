@@ -11,7 +11,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.requests import Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from store import MessageStore
@@ -45,6 +45,20 @@ ws_clients: set[WebSocket] = set()
 
 # --- Security: session token (set by configure()) ---
 session_token: str = ""
+
+# Built-in auth manager (set by configure(); None only if argon2 missing)
+try:
+    from auth import AuthManager, COOKIE_NAME, is_external_http, client_ip
+except ImportError:
+    AuthManager = None  # type: ignore
+    COOKIE_NAME = "agentchattr_session"
+    def is_external_http(request) -> bool:  # type: ignore
+        xfp = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+        return xfp == "https"
+    def client_ip(request) -> str:  # type: ignore
+        return request.client.host if request.client else "unknown"
+auth_mgr = None
+
 
 # Room settings (persisted to data/settings.json)
 room_settings: dict = {
@@ -210,6 +224,45 @@ def _install_security_middleware(token: str, cfg: dict):
         async def dispatch(self, request: Request, call_next):
             path = request.url.path
 
+            # ---- Built-in auth: external (HTTPS-proxied) traffic ----
+            # Loopback keeps the existing session-token behavior (launcher scripts).
+            # External must present the signed login cookie on everything except
+            # the login page, its static assets, and the auth endpoints.
+            external = is_external_http(request)
+            if external:
+                if path.startswith("/login"):
+                    return await call_next(request)
+                auth_user = _self.auth_mgr.verify_session(request.cookies.get(COOKIE_NAME)) if _self.auth_mgr else None
+                if auth_user:
+                    request.state.auth_user = auth_user
+                    # CSRF: same-origin only for the public host (Host header comes
+                    # through our nginx; the forwarded-proto gate makes it authentic).
+                    origin = request.headers.get("origin")
+                    host = request.headers.get("host", "").split(":")[0]
+                    if origin:
+                        public_origin = f"https://{host}"
+                        if origin != public_origin:
+                            return JSONResponse(
+                                {"error": "forbidden: origin not allowed"},
+                                status_code=403,
+                            )
+                    if path == "/":
+                        # Index served to a logged-in browser: inject token like today.
+                        return await call_next(request)
+                    return await call_next(request)
+                if path in ("/auth/login", "/auth/logout"):
+                    return await call_next(request)
+                if path.startswith(("/static/", "/uploads/")):
+                    return await call_next(request)
+                accept = request.headers.get("accept", "")
+                if "text/html" in accept:
+                    from fastapi.responses import RedirectResponse
+                    return RedirectResponse("/login", status_code=302)
+                return JSONResponse(
+                    {"error": "unauthorized: log in at /login"},
+                    status_code=401,
+                )
+
             # Static assets, index page, and uploaded images are public.
             # The index page injects the token client-side via same-origin script.
             # Uploads use random filenames and have path-traversal protection.
@@ -218,10 +271,10 @@ def _install_security_middleware(token: str, cfg: dict):
 
             # Agent registration/heartbeat: loopback only (no remote agent minting).
             if path.startswith(("/api/register", "/api/deregister/", "/api/heartbeat/")):
-                client_ip = request.client.host if request.client else ""
-                if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                cip = request.client.host if request.client else ""
+                if cip not in ("127.0.0.1", "::1", "localhost"):
                     return JSONResponse(
-                        {"error": f"forbidden: agent registration is restricted to local loopback. Source {client_ip} is not allowed."},
+                        {"error": f"forbidden: agent registration is restricted to local loopback. Source {cip} is not allowed."},
                         status_code=403,
                     )
                 return await call_next(request)
@@ -258,9 +311,144 @@ def _install_security_middleware(token: str, cfg: dict):
     app.add_middleware(SecurityMiddleware)
 
 
+_LOGIN_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentchattr — log in</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#0f1419; color:#e6edf3; font-family: system-ui, sans-serif; }
+  .card { background:#171e26; border:1px solid #2b3542; border-radius:12px; padding:32px; width:min(360px, 90vw); }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { color:#8b98a5; font-size:13px; margin:0 0 20px; }
+  label { display:block; font-size:12px; color:#8b98a5; margin:12px 0 4px; }
+  input { width:100%; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid #2b3542;
+          background:#0f1419; color:#e6edf3; font-size:14px; }
+  input:focus { outline:none; border-color:#4c8dff; }
+  button { margin-top:20px; width:100%; padding:11px; border:none; border-radius:8px; background:#4c8dff;
+           color:#fff; font-size:14px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:default; }
+  #err { color:#ff7b72; font-size:13px; min-height:18px; margin-top:12px; }
+</style>
+</head>
+<body>
+<form class="card" id="f" autocomplete="on">
+  <h1>agentchattr</h1>
+  <p class="sub">Sign in to the room</p>
+  <label for="u">Username</label>
+  <input id="u" name="username" autocomplete="username" required>
+  <label for="p">Password</label>
+  <input id="p" name="password" type="password" autocomplete="current-password" required>
+  <button id="b" type="submit">Log in</button>
+  <div id="err"></div>
+</form>
+<script>
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById('b'), err = document.getElementById('err');
+  btn.disabled = true; err.textContent = '';
+  try {
+    const r = await fetch('/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('u').value,
+        password: document.getElementById('p').value
+      })
+    });
+    if (r.ok) { location.href = '/'; return; }
+    const d = await r.json().catch(() => ({}));
+    err.textContent = d.error || d.detail || ('Login failed (' + r.status + ')');
+    if (d.retry_after) {
+      let s = Math.ceil(d.retry_after);
+      const t = setInterval(() => {
+        err.textContent = (d.error || 'Too many attempts') + ' — try again in ' + s + 's';
+        if (--s <= 0) { clearInterval(t); btn.disabled = false; err.textContent = ''; }
+      }, 1000);
+      return;
+    }
+  } catch (ex) {
+    err.textContent = 'Network error';
+  }
+  btn.disabled = false;
+});
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/login")
+async def login_page(request: Request):
+    # Already logged in externally? Go straight to the room.
+    if auth_mgr and auth_mgr.verify_session(request.cookies.get(COOKIE_NAME)):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse("/", status_code=302)
+    return HTMLResponse(_LOGIN_HTML, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/auth/login")
+async def auth_login(request: Request):
+    if not auth_mgr:
+        return JSONResponse({"error": "auth unavailable on this server"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    ip = client_ip(request)
+
+    allowed, retry_after = auth_mgr.limiter.allow(ip, username)
+    if not allowed:
+        return JSONResponse(
+            {"error": "too many failed attempts", "retry_after": retry_after},
+            status_code=429,
+        )
+    if not username or not password or not auth_mgr.verify_password(username, password):
+        auth_mgr.limiter.record_failure(ip, username)
+        return JSONResponse({"error": "invalid username or password"}, status_code=401)
+
+    auth_mgr.limiter.record_success(ip, username)
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        COOKIE_NAME,
+        auth_mgr.make_session(username),
+        max_age=14 * 24 * 3600,
+        secure=True,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return resp
+
+
+@app.post("/auth/logout")
+async def auth_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(COOKIE_NAME, path="/", secure=True, httponly=True, samesite="lax")
+    return resp
+
+
+
 def configure(cfg: dict, session_token: str = ""):
-    global store, rules, summaries, jobs, schedules, router, agents, registry, session_store, session_engine, config
+    global store, rules, summaries, jobs, schedules, router, agents, registry, session_store, session_engine, config, auth_mgr
     config = cfg
+    # --- Auth: built-in login for external (HTTPS-proxied) traffic ---
+    _data_dir = Path(cfg.get("server", {}).get("data_dir", "./data"))
+    if not _data_dir.is_absolute():
+        _data_dir = Path(__file__).parent / _data_dir
+    try:
+        auth_mgr = AuthManager(_data_dir)
+        action = auth_mgr.bootstrap()
+        if action == "generated":
+            print(f"AUTH: no users found — generated first-run credentials at "
+                  f"{auth_mgr.credentials_file} (username 'lucas', delete after login)")
+    except RuntimeError as e:
+        auth_mgr = None
+        print(f"WARNING: built-in auth unavailable: {e} — external requests will be denied")
     # --- Security: store the session token and install middleware ---
     _install_security_middleware(session_token, cfg)
 
@@ -1069,6 +1257,14 @@ def _on_registry_change():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    # External (HTTPS-proxied) WebSocket: must present the login session cookie.
+    # The in-band session token alone is not shipped to external clients anymore.
+    if is_external_http(websocket):
+        ws_user = auth_mgr.verify_session(websocket.cookies.get(COOKIE_NAME)) if auth_mgr else None
+        if not ws_user:
+            await websocket.close(code=4003, reason="forbidden: login required")
+            return
+
     # --- Security: validate session token on WebSocket connect ---
     token = websocket.query_params.get("token", "")
     if token != session_token:
