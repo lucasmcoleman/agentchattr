@@ -1257,22 +1257,28 @@ def _on_registry_change():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    # External (HTTPS-proxied) WebSocket: must present the login session cookie.
-    # The in-band session token alone is not shipped to external clients anymore.
+    # External (HTTPS-proxied) WebSocket: must present the built-in login cookie.
+    # A valid cookie skips the in-band token requirement (the phone app never
+    # sees the room token by design); loopback keeps the token flow unchanged.
+    external_cookie_ok = False
     if is_external_http(websocket):
         ws_user = auth_mgr.verify_session(websocket.cookies.get(COOKIE_NAME)) if auth_mgr else None
-        if not ws_user:
+        if ws_user:
+            external_cookie_ok = True
+        else:
+            await websocket.accept()
             await websocket.close(code=4003, reason="forbidden: login required")
             return
 
     # --- Security: validate session token on WebSocket connect ---
-    token = websocket.query_params.get("token", "")
-    if token != session_token:
-        # Must accept before closing so the browser receives the close frame.
-        # Code 4003 triggers an auto-reload in the client to pick up the new token.
-        await websocket.accept()
-        await websocket.close(code=4003, reason="forbidden: invalid session token")
-        return
+    if not external_cookie_ok:
+        token = websocket.query_params.get("token", "")
+        if token != session_token:
+            # Must accept before closing so the browser receives the close frame.
+            # Code 4003 triggers an auto-reload in the client to pick up the new token.
+            await websocket.accept()
+            await websocket.close(code=4003, reason="forbidden: invalid session token")
+            return
 
     await websocket.accept()
     ws_clients.add(websocket)
