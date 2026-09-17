@@ -87,6 +87,9 @@ class AuthManager:
         self.credentials_file = self.data_dir / "INITIAL-CREDENTIALS.txt"
         self.hasher = PasswordHasher()  # argon2id per current library defaults
         self.limiter = RateLimiter()
+        # Username-independent per-IP bucket: stops username-rotating floods from
+        # burning the event loop / locking a single account via per-(ip,user) keys.
+        self.ip_limiter = RateLimiter()
         self.secret = self._load_or_create_secret()
         self.generated_password: str | None = None  # set only by first-run bootstrap
 
@@ -249,7 +252,13 @@ def is_external_http(request) -> bool:
 
 
 def client_ip(request) -> str:
-    # For rate limiting use the socket peer when loopback-visible; XFF is only trusted
-    # chain-wise if a proxy sets it — nginx over a Unix socket sees the PC's IP, so
-    # the socket peer is the honest value on this architecture.
+    # External (HTTPS-proxied) requests: trust X-Real-IP set by our own nginx.
+    # Over the ssh -R tunnel every socket peer is 127.0.0.1, so without this all
+    # public users would share a single rate-limit bucket (Claude review #3).
+    # Only trusted on the XFP=https path that only our nginx can set.
+    if is_external_http(request):
+        rip = (request.headers.get("x-real-ip") or "").strip()
+        if rip:
+            return rip
+    # Loopback: socket peer is the honest value on this architecture.
     return request.client.host if request.client else "unknown"

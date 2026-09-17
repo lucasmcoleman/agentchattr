@@ -548,11 +548,26 @@ async def auth_login(request: Request):
             {"error": "too many failed attempts", "retry_after": retry_after},
             status_code=429,
         )
-    if not username or not password or not auth_mgr.verify_password(username, password):
+    # Same flood protection independent of which username is targeted.
+    allowed, retry_after = auth_mgr.ip_limiter.allow(ip, "")
+    if not allowed:
+        return JSONResponse(
+            {"error": "too many failed attempts", "retry_after": retry_after},
+            status_code=429,
+        )
+    # argon2 verify is CPU-heavy (~100ms+): keep it OFF the event loop so a flood
+    # can't freeze the chat for all agents (Claude review #2).
+    from starlette.concurrency import run_in_threadpool
+    ok = username and password and await run_in_threadpool(
+        auth_mgr.verify_password, username, password
+    )
+    if not ok:
         auth_mgr.limiter.record_failure(ip, username)
+        auth_mgr.ip_limiter.record_failure(ip, "")
         return JSONResponse({"error": "invalid username or password"}, status_code=401)
 
     auth_mgr.limiter.record_success(ip, username)
+    auth_mgr.ip_limiter.record_success(ip, "")
     resp = JSONResponse({"ok": True})
     resp.set_cookie(
         COOKIE_NAME,
