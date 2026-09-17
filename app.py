@@ -250,7 +250,9 @@ def _install_security_middleware(token: str, cfg: dict):
                         # Index served to a logged-in browser: inject token like today.
                         return await call_next(request)
                     return await call_next(request)
-                if path in ("/auth/login", "/auth/logout"):
+                # Logged-out external traffic: the change-password page is the account
+                # page, and it must redirect to the login page itself (not 401/302-wrap).
+                if path.startswith("/account") or path in ("/auth/login", "/auth/logout", "/auth/change"):
                     return await call_next(request)
                 if path.startswith(("/static/", "/uploads/")):
                     return await call_next(request)
@@ -267,6 +269,11 @@ def _install_security_middleware(token: str, cfg: dict):
             # The index page injects the token client-side via same-origin script.
             # Uploads use random filenames and have path-traversal protection.
             if path == "/" or path.startswith(("/static/", "/uploads/", "/api/roles")):
+                return await call_next(request)
+
+            # Login/account pages answer on loopback with an explanatory note
+            # (no built-in session exists in the local realm).
+            if path.startswith(("/login", "/account")):
                 return await call_next(request)
 
             # Agent registration/heartbeat: loopback only (no remote agent minting).
@@ -380,13 +387,147 @@ document.getElementById('f').addEventListener('submit', async (e) => {
 """
 
 
+_CHANGE_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentchattr — account</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#0f1419; color:#e6edf3; font-family: system-ui, sans-serif; }
+  .card { background:#171e26; border:1px solid #2b3542; border-radius:12px; padding:32px; width:min(360px, 90vw); }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { color:#8b98a5; font-size:13px; margin:0 0 20px; }
+  label { display:block; font-size:12px; color:#8b98a5; margin:12px 0 4px; }
+  input { width:100%; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid #2b3542;
+          background:#0f1419; color:#e6edf3; font-size:14px; }
+  input:focus { outline:none; border-color:#4c8dff; }
+  button { margin-top:20px; width:100%; padding:11px; border:none; border-radius:8px; background:#4c8dff;
+           color:#fff; font-size:14px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:default; }
+  #err { color:#ff7b72; font-size:13px; min-height:18px; margin-top:12px; }
+  #ok { color:#7ee787; font-size:13px; margin-top:12px; }
+  .links { margin-top:16px; display:flex; justify-content:space-between; font-size:13px; }
+  a { color:#4c8dff; text-decoration:none; }
+</style>
+</head>
+<body>
+<form class="card" id="f" autocomplete="on">
+  <h1>Change password</h1>
+  <p class="sub">Signed in as __USER__</p>
+  <label for="old">Current password</label>
+  <input id="old" type="password" autocomplete="current-password" required>
+  <label for="new">New password (min 8 chars)</label>
+  <input id="new" type="password" autocomplete="new-password" minlength="8" required>
+  <label for="confirm">Confirm new password</label>
+  <input id="confirm" type="password" autocomplete="new-password" minlength="8" required>
+  <button id="b" type="submit">Change password</button>
+  <div id="err"></div>
+  <div id="ok" class="hidden" style="display:none"></div>
+  <div class="links">
+    <a href="/">Back to room</a>
+    <a href="#" id="logout">Log out</a>
+  </div>
+</form>
+<script>
+document.getElementById('logout').addEventListener('click', async (e) => {
+  e.preventDefault();
+  await fetch('/auth/logout', { method: 'POST' });
+  location.href = '/login';
+});
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById('b'), err = document.getElementById('err'), ok = document.getElementById('ok');
+  err.textContent = ''; ok.style.display = 'none';
+  const nw = document.getElementById('new').value;
+  if (nw !== document.getElementById('confirm').value) { err.textContent = 'New passwords do not match'; return; }
+  if (nw.length < 8) { err.textContent = 'New password must be at least 8 characters'; return; }
+  btn.disabled = true;
+  try {
+    const r = await fetch('/auth/change', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ old_password: document.getElementById('old').value, new_password: nw })
+    });
+    if (r.ok) {
+      document.getElementById('f').reset();
+      ok.textContent = 'Password changed. Other sessions were signed out; this one stays logged in.';
+      ok.style.display = 'block';
+      btn.disabled = false;
+      return;
+    }
+    const d = await r.json().catch(() => ({}));
+    if (r.status === 401) { err.textContent = 'Session expired — log in again.'; setTimeout(() => location.href = '/login', 1500); return; }
+    if (d.retry_after) {
+      let s = Math.ceil(d.retry_after);
+      const t = setInterval(() => {
+        err.textContent = 'Too many attempts — try again in ' + s + 's';
+        if (--s <= 0) { clearInterval(t); btn.disabled = false; err.textContent = ''; }
+      }, 1000);
+      return;
+    }
+    err.textContent = d.error || d.detail || ('Change failed (' + r.status + ')');
+  } catch (ex) {
+    err.textContent = 'Network error';
+  }
+  btn.disabled = false;
+});
+</script>
+</body>
+</html>
+"""
+
+_LOOPBACK_NOTE_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentchattr — account</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#0f1419; color:#e6edf3; font-family: system-ui, sans-serif; }
+  .card { background:#171e26; border:1px solid #2b3542; border-radius:12px; padding:32px; width:min(420px, 90vw); }
+  h1 { font-size:18px; margin:0 0 8px; }
+  p { color:#8b98a5; font-size:14px; line-height:1.5; }
+  a { color:#4c8dff; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Built-in accounts work over the public URL</h1>
+  <p>You reached this page over loopback, where the room runs with its local session token
+  and login isn't required. To change your password, open this server through its public
+  HTTPS address, sign in, and use <a href="/account">Account → Change password</a> there.</p>
+  <p><a href="/">Back to room</a></p>
+</div>
+</body>
+</html>
+"""
+
+
 @app.get("/login")
 async def login_page(request: Request):
-    # Already logged in externally? Go straight to the room.
+    from fastapi.responses import RedirectResponse
+    if not is_external_http(request):
+        # Loopback realm: no login needed locally; account changes go through the public URL.
+        return HTMLResponse(_LOOPBACK_NOTE_HTML, headers={"Cache-Control": "no-store"})
     if auth_mgr and auth_mgr.verify_session(request.cookies.get(COOKIE_NAME)):
-        from fastapi.responses import RedirectResponse
+        # Already logged in externally: straight to the room (change password via Account).
         return RedirectResponse("/", status_code=302)
     return HTMLResponse(_LOGIN_HTML, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/account")
+async def account_page(request: Request):
+    """Change-password form for the logged-in external user."""
+    from fastapi.responses import RedirectResponse
+    if not is_external_http(request):
+        return HTMLResponse(_LOOPBACK_NOTE_HTML, headers={"Cache-Control": "no-store"})
+    user = auth_mgr.verify_session(request.cookies.get(COOKIE_NAME)) if auth_mgr else None
+    if not user:
+        return RedirectResponse("/login", status_code=302)
+    return HTMLResponse(_CHANGE_HTML.replace("__USER__", user), headers={"Cache-Control": "no-store"})
 
 
 @app.post("/auth/login")
@@ -429,6 +570,60 @@ async def auth_login(request: Request):
 async def auth_logout():
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(COOKIE_NAME, path="/", secure=True, httponly=True, samesite="lax")
+    return resp
+
+
+@app.post("/auth/change")
+async def auth_change(request: Request):
+    """Change password for the logged-in user (external realm).
+
+    Requires a valid session cookie; verifies the old password; bumps the user's
+    session version so all older cookies stop working, then issues a fresh one.
+    Same-origin (CSRF) and rate-limited like login.
+    """
+    if not auth_mgr:
+        return JSONResponse({"error": "auth unavailable on this server"}, status_code=503)
+    user = auth_mgr.verify_session(request.cookies.get(COOKIE_NAME))
+    if not user:
+        return JSONResponse({"error": "unauthorized: log in first"}, status_code=401)
+    # CSRF: browser senders must be same-origin with the public host we serve.
+    origin = request.headers.get("origin")
+    if origin:
+        host = request.headers.get("host", "").split(":")[0]
+        public_origin = f"https://{host}"
+        if origin != public_origin:
+            return JSONResponse({"error": "forbidden: origin not allowed"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    old_password = str(body.get("old_password", ""))
+    new_password = str(body.get("new_password", ""))
+    ip = client_ip(request)
+
+    allowed, retry_after = auth_mgr.limiter.allow(ip, user)
+    if not allowed:
+        return JSONResponse(
+            {"error": "too many failed attempts", "retry_after": retry_after},
+            status_code=429,
+        )
+    if not auth_mgr.change_password(user, old_password, new_password):
+        auth_mgr.limiter.record_failure(ip, user)
+        return JSONResponse(
+            {"error": "change failed: wrong current password or new password too short (min 8)"},
+            status_code=403,
+        )
+    auth_mgr.limiter.record_success(ip, user)
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        COOKIE_NAME,
+        auth_mgr.make_session(user),
+        max_age=14 * 24 * 3600,
+        secure=True,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
     return resp
 
 

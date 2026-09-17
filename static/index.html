@@ -132,6 +132,20 @@
                     <input type="file" id="import-file" accept=".zip" style="display:none" onchange="importHistory(this)">
                 </div>
             </div>
+            <div class="settings-divider"></div>
+            <div class="settings-field" id="account-field" style="display:none">
+                <label>Account</label>
+                <div class="settings-history-btns">
+                    <button class="settings-btn" onclick="location.href='/account'">Change password / log out</button>
+                </div>
+            </div>
+            <script>
+              // Show the Account section only when served over the public HTTPS realm;
+              // loopback local use has no built-in session to manage.
+              if (window.location.protocol === 'https:') {
+                document.getElementById('account-field').style.display = '';
+              }
+            </script>
         </div>
 
         <div id="pins-panel" class="hidden">

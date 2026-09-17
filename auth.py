@@ -140,26 +140,47 @@ class AuthManager:
         except Exception:
             return {}
 
-    def _save_user(self, username: str, password: str) -> None:
+    @staticmethod
+    def _record_hash(rec) -> str:
+        """Support both legacy plain-string hashes and versioned dict records."""
+        if isinstance(rec, dict):
+            return rec.get("h", "")
+        return rec or ""
+
+    @staticmethod
+    def _record_version(rec) -> int:
+        if isinstance(rec, dict):
+            try:
+                return int(rec.get("v", 0))
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def _user_version(self, username: str) -> int:
+        return self._record_version(self._load_users().get(username))
+
+    def _save_user(self, username: str, password: str, version: int | None = None) -> None:
         import json
         users = self._load_users()
-        users[username] = self.hasher.hash(password)
+        if version is None:
+            version = self._record_version(users.get(username))
+        users[username] = {"h": self.hasher.hash(password), "v": version}
         tmp = self.users_path.with_suffix(".tmp")
         self._write_private(tmp, json.dumps(users, indent=2))
         os.replace(tmp, self.users_path)
 
     def verify_password(self, username: str, password: str) -> bool:
         users = self._load_users()
-        stored = users.get(username)
+        stored = self._record_hash(users.get(username))
         if not stored:
             # Constant-ish time: hash anyway so user enumeration via timing is muted.
             self.hasher.hash(password)
             return False
         try:
             self.hasher.verify(stored, password)
-            # Transparent rehash on parameter upgrades:
+            # Transparent rehash on parameter upgrades (preserve session version):
             if self.hasher.check_needs_rehash(stored):
-                self._save_user(username, password)
+                self._save_user(username, password, version=self._record_version(users.get(username)))
             return True
         except (VerifyMismatchError, VerificationError, InvalidHashError):
             return False
@@ -169,7 +190,8 @@ class AuthManager:
             return False
         if len(new_password) < 8:
             return False
-        self._save_user(username, new_password)
+        # Bump the session version so ALL previously issued cookies stop working.
+        self._save_user(username, new_password, version=self._user_version(username) + 1)
         return True
 
     # ---------- session cookies ----------
@@ -177,19 +199,24 @@ class AuthManager:
     def make_session(self, username: str) -> str:
         expiry = int(time.time()) + SESSION_TTL_SECONDS
         nonce = secrets.token_hex(8)
-        base = f"{username}|{expiry}|{nonce}"
+        ver = self._user_version(username)
+        base = f"{username}|{expiry}|{nonce}|{ver}"
         sig = hmac.new(self.secret, base.encode("utf-8"), hashlib.sha256).hexdigest()
         return f"{base}|{sig}"
 
     def verify_session(self, cookie_value: str | None) -> str | None:
-        """Return the username for a valid unexpired signed cookie, else None."""
+        """Return the username for a valid unexpired signed cookie, else None.
+
+        The session embeds the user's password version; a password change bumps it,
+        which invalidates every cookie issued before the change (stateless revoke).
+        """
         if not cookie_value:
             return None
         parts = cookie_value.split("|")
-        if len(parts) != 4:
+        if len(parts) != 5:
             return None
-        username, expiry, nonce, sig = parts
-        base = f"{username}|{expiry}|{nonce}"
+        username, expiry, nonce, ver, sig = parts
+        base = f"{username}|{expiry}|{nonce}|{ver}"
         expected = hmac.new(self.secret, base.encode("utf-8"), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected):
             return None
@@ -197,6 +224,13 @@ class AuthManager:
             if int(expiry) < time.time():
                 return None
         except ValueError:
+            return None
+        # Live version check: stale-version cookies are dead even if correctly signed.
+        users = self._load_users()
+        rec = users.get(username)
+        if rec is None:
+            return None
+        if self._record_version(rec) != int(ver):
             return None
         return username
 
