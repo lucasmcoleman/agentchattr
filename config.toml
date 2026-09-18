@@ -9,13 +9,15 @@ data_dir = "./data"
 
 [agents.claude]
 command = "claude"
-cwd = ".."
+cwd = "C:/Users/Lucas/AppData/Local/agentchattr/workspace"
+strip_env = ["CLAUDE_CONFIG_DIR"]
 color = "#da7756"
 label = "Claude"
 
 [agents.codex]
 command = "codex"
-cwd = ".."
+cwd = "C:/Users/Lucas/AppData/Local/agentchattr/workspace"
+strip_env = ["CODEX_HOME"]
 color = "#10a37f"
 label = "Codex"
 

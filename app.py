@@ -69,6 +69,9 @@ room_settings: dict = {
     "username": "user",
     "font": "sans",
     "channels": ["general"],
+    # Channels wrapped up but kept: readable, not writable, and not
+    # replayed on connect. Still listed in "channels" so history is never orphaned.
+    "closed_channels": [],
     "history_limit": "all",
     "contrast": "normal",
     "custom_roles": [],
@@ -1538,7 +1541,10 @@ async def websocket_endpoint(websocket: WebSocket):
     count = 10000 if limit_val == "all" else int(limit_val)
     
     history = []
+    closed = set(room_settings.get("closed_channels", []))
     for ch in room_settings["channels"]:
+        if ch in closed:
+            continue  # closed channels load on demand, not at startup
         history.extend(store.get_recent(count, channel=ch))
     
     # Sort history by timestamp to interleave messages from different channels correctly
@@ -1568,6 +1574,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 channel = event.get("channel", "general")
 
                 if not text and not attachments:
+                    continue
+
+                # A closed channel is read-only. Slash commands are blocked too:
+                # /clear on a wrapped-up project would be the one destructive way in.
+                if channel in room_settings.get("closed_channels", []):
+                    await websocket.send_text(json.dumps({
+                        "type": "channel_closed",
+                        "channel": channel,
+                    }))
                     continue
 
                 # Command handling
@@ -1849,6 +1864,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 idx = room_settings["channels"].index(old_name)
                 room_settings["channels"][idx] = new_name
+                closed = room_settings.get("closed_channels", [])
+                if old_name in closed:
+                    closed[closed.index(old_name)] = new_name
                 store.rename_channel(old_name, new_name)
                 import mcp_bridge
                 mcp_bridge.migrate_cursors_rename(old_name, new_name)
@@ -1866,6 +1884,23 @@ async def websocket_endpoint(websocket: WebSocket):
                     except Exception:
                         pass
 
+            elif event.get("type") in ("channel_close", "channel_open"):
+                name = (event.get("name") or "").strip().lower()
+                closing = event.get("type") == "channel_close"
+                if name == "general" or name not in room_settings["channels"]:
+                    continue
+                closed = room_settings.setdefault("closed_channels", [])
+                # Read cursors are deliberately left alone: a reopened channel
+                # must not replay its whole history to the next agent that reads it.
+                if closing and name not in closed:
+                    closed.append(name)
+                elif not closing and name in closed:
+                    closed.remove(name)
+                else:
+                    continue
+                _save_settings()
+                await broadcast_settings()
+
             elif event.get("type") == "channel_delete":
                 name = (event.get("name") or "").strip().lower()
                 if name == "general":
@@ -1873,6 +1908,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 if name not in room_settings["channels"]:
                     continue
                 room_settings["channels"].remove(name)
+                if name in room_settings.get("closed_channels", []):
+                    room_settings["closed_channels"].remove(name)
                 store.delete_channel(name)
                 import mcp_bridge
                 mcp_bridge.migrate_cursors_delete(name)

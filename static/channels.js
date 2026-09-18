@@ -30,6 +30,44 @@ function _getTopVisibleMsgId() {
 // Render
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// Closed channels: a wrapped-up project stays readable, but nothing new lands
+// in it. The server enforces this; here we just stop offering the controls.
+// ---------------------------------------------------------------------------
+
+function isChannelClosed(name) {
+    return (window.closedChannels || []).includes(name);
+}
+
+function setChannelClosed(name, closed) {
+    if (window.ws) window.ws.send(JSON.stringify({ type: closed ? 'channel_close' : 'channel_open', name }));
+}
+
+function _closeToggleButton(name) {
+    const closed = isChannelClosed(name);
+    const btn = document.createElement('button');
+    btn.className = 'ch-close-btn';
+    btn.title = closed ? 'Reopen channel' : 'Close channel (keeps history)';
+    btn.textContent = closed ? '\u21ba' : '\u2298';
+    btn.onclick = (e) => { e.stopPropagation(); setChannelClosed(name, !closed); };
+    return btn;
+}
+
+// Lock or unlock the composer for whichever channel is open now.
+function applyChannelClosedState() {
+    const input = document.getElementById('input');
+    const closed = isChannelClosed(window.activeChannel);
+    if (input) {
+        input.disabled = closed;
+        input.placeholder = closed
+            ? 'This channel is closed. Reopen it to post.'
+            : 'Type a message... (use @name to mention agents)';
+    }
+    document.body.classList.toggle('channel-is-closed', closed);
+    if (typeof renderChannelTabs === 'function') renderChannelTabs();
+}
+
 function renderChannelTabs() {
     const container = document.getElementById('channel-tabs');
     if (!container) return;
@@ -40,8 +78,11 @@ function renderChannelTabs() {
     container.innerHTML = '';
 
     for (const name of window.channelList) {
+        // Closed channels live in the sidebar's Closed section, not the tab row.
+        if (isChannelClosed(name) && name !== window.activeChannel) continue;
         const tab = document.createElement('button');
-        tab.className = 'channel-tab' + (name === window.activeChannel ? ' active' : '');
+        tab.className = 'channel-tab' + (name === window.activeChannel ? ' active' : '')
+            + (isChannelClosed(name) ? ' closed' : '');
         tab.dataset.channel = name;
 
         const label = document.createElement('span');
@@ -75,6 +116,7 @@ function renderChannelTabs() {
             delBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6 4V3h4v1M5 4v8.5h6V4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
             delBtn.onclick = (e) => { e.stopPropagation(); deleteChannel(name); };
             actions.appendChild(delBtn);
+            actions.appendChild(_closeToggleButton(name));
 
             tab.appendChild(actions);
         }
@@ -116,6 +158,7 @@ function renderChannelSidebar() {
     list.innerHTML = '';
 
     for (const name of window.channelList) {
+        if (isChannelClosed(name)) continue;  // rendered under "Closed" below
         const row = document.createElement('button');
         row.className = 'channel-sidebar-row' + (name === window.activeChannel ? ' active' : '');
         row.dataset.channel = name;
@@ -148,6 +191,7 @@ function renderChannelSidebar() {
             delBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6 4V3h4v1M5 4v8.5h6V4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
             delBtn.onclick = (e) => { e.stopPropagation(); _sidebarConfirmDelete(name, row, label); };
             actions.appendChild(delBtn);
+            actions.appendChild(_closeToggleButton(name));
 
             row.appendChild(actions);
         }
@@ -162,6 +206,43 @@ function renderChannelSidebar() {
 
     if (existingCreate) list.appendChild(existingCreate);
 
+    _renderClosedSection(list);
+}
+
+// Collapsed "Closed" group at the bottom of the sidebar.
+function _renderClosedSection(list) {
+    const closed = window.channelList.filter(isChannelClosed);
+    if (!closed.length) return;
+
+    const expanded = localStorage.getItem('agentchattr-closed-expanded') === '1';
+    const header = document.createElement('button');
+    header.className = 'channel-closed-header';
+    header.textContent = (expanded ? '\u25be' : '\u25b8') + ' Closed (' + closed.length + ')';
+    header.onclick = () => {
+        localStorage.setItem('agentchattr-closed-expanded', expanded ? '0' : '1');
+        renderChannelSidebar();
+    };
+    list.appendChild(header);
+    if (!expanded) return;
+
+    for (const name of closed) {
+        const row = document.createElement('button');
+        row.className = 'channel-sidebar-row closed' + (name === window.activeChannel ? ' active' : '');
+        row.dataset.channel = name;
+        const label = document.createElement('span');
+        label.className = 'channel-sidebar-row-label';
+        label.textContent = '# ' + name;
+        row.appendChild(label);
+        const actions = document.createElement('span');
+        actions.className = 'channel-sidebar-row-actions';
+        actions.appendChild(_closeToggleButton(name));
+        row.appendChild(actions);
+        row.onclick = (e) => {
+            if (e.target.closest('.channel-sidebar-row-actions')) return;
+            if (name !== window.activeChannel) switchChannel(name);
+        };
+        list.appendChild(row);
+    }
 }
 
 function _showSidebarRenameDialog(oldName) {
@@ -294,6 +375,7 @@ function switchChannel(name) {
     window.channelUnread[name] = 0;
     localStorage.setItem('agentchattr-channel', name);
     filterMessagesByChannel();
+    applyChannelClosedState();
     renderChannelTabs();
     Store.set('activeChannel', name);
     document.querySelector('#channel-tabs .channel-tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
@@ -675,6 +757,8 @@ window.showChannelCreateDialog = showChannelCreateDialog;
 window.switchChannel = switchChannel;
 window.filterMessagesByChannel = filterMessagesByChannel;
 window.renderChannelTabs = renderChannelTabs;
+window.applyChannelClosedState = applyChannelClosedState;
+window.isChannelClosed = isChannelClosed;
 window.deleteChannel = deleteChannel;
 window.showChannelRenameDialog = showChannelRenameDialog;
 window.renderChannelSidebar = renderChannelSidebar;

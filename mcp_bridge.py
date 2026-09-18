@@ -234,6 +234,9 @@ def chat_send(
     # Final fallback if still nothing: original 'general' behavior.
     if not channel and not job_id:
         channel = "general"
+    # A closed channel is read-only: chat_read still works, sending does not.
+    if room_settings and channel in room_settings.get("closed_channels", []):
+        return f"Error: channel '{channel}' is closed (read-only). Ask Lucas to reopen it before posting."
     # Block pending instances (identity not yet confirmed)
     if registry and registry.is_pending(sender):
         return "Error: identity not confirmed. Call chat_claim(sender=your_base_name) to get your identity."
@@ -886,9 +889,14 @@ def chat_claim(sender: str, name: str = "", ctx: Context | None = None) -> str:
 
 
 def chat_channels() -> str:
-    """List all available channels. Returns a JSON array of channel names."""
+    """List all available channels. Returns a JSON array of channel names.
+
+    Closed channels are left out: they are readable by name via chat_read but
+    cannot be posted to, so offering them as a destination would only mislead.
+    """
     channels = room_settings.get("channels", ["general"]) if room_settings else ["general"]
-    return json.dumps(channels)
+    closed = room_settings.get("closed_channels", []) if room_settings else []
+    return json.dumps([c for c in channels if c not in closed])
 
 
 def chat_summary(
