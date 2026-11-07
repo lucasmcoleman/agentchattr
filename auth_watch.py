@@ -21,31 +21,40 @@ AUTH_EXPIRED_LINE = re.compile(
 )
 
 DEFAULT_COOLDOWN = 30 * 60  # seconds between alerts for the same agent
+RETRY_AFTER = 60            # seconds before retrying a failed delivery
 
 
 class AuthExpiryWatch:
-    def __init__(self, notify, *, cooldown: float = DEFAULT_COOLDOWN, clock=time.monotonic):
+    def __init__(self, notify, *, cooldown: float = DEFAULT_COOLDOWN,
+                 retry_after: float = RETRY_AFTER, clock=time.monotonic):
         self._notify = notify
         self._cooldown = cooldown
+        self._retry_after = retry_after
         self._clock = clock
         self._last_count = 0
-        self._last_alert = None
+        self._next_try = None   # no alert before this time
+        self._retry = False     # last delivery failed; try again while still visible
 
     def observe(self, screen_text: str) -> bool:
-        """Feed the visible screen. Returns True when an alert was sent."""
+        """Feed the visible screen. Returns True only when an alert was delivered."""
         count = len(AUTH_EXPIRED_LINE.findall(screen_text or ""))
         grew = count > self._last_count
         self._last_count = count
-        if not grew:
+        if count == 0:
+            self._retry = False
+        if not (grew or self._retry):
             return False
         now = self._clock()
-        if self._last_alert is not None and now - self._last_alert < self._cooldown:
+        if self._next_try is not None and now < self._next_try:
             return False
-        self._last_alert = now
         try:
             self._notify()
         except Exception:
-            pass
+            self._retry = True
+            self._next_try = now + self._retry_after
+            return False
+        self._retry = False
+        self._next_try = now + self._cooldown
         return True
 
 

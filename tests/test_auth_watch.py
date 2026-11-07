@@ -59,11 +59,35 @@ class AuthWatchTests(unittest.TestCase):
         self.assertFalse(self.watch.observe(""))
         self.assertFalse(self.watch.observe(None))
 
-    def test_notify_failure_is_swallowed(self):
-        def boom():
+    def test_failed_delivery_retries_while_still_expired(self):
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("server down")
+        watch = AuthExpiryWatch(flaky, cooldown=1800, retry_after=60, clock=self.clock)
+        self.assertFalse(watch.observe(EXPIRED))   # send failed: not reported as alerted
+        self.clock.t += 30
+        self.assertFalse(watch.observe(EXPIRED))   # waits for retry_after
+        self.clock.t += 31
+        self.assertTrue(watch.observe(EXPIRED))    # retried and delivered
+        self.clock.t += 61
+        self.assertFalse(watch.observe(EXPIRED))   # delivered: back to the cooldown
+        self.assertEqual(len(calls), 2)
+
+    def test_failed_delivery_stops_retrying_once_login_fixed(self):
+        calls = []
+
+        def down():
+            calls.append(1)
             raise OSError("server down")
-        watch = AuthExpiryWatch(boom, clock=self.clock)
-        self.assertTrue(watch.observe(EXPIRED))
+        watch = AuthExpiryWatch(down, retry_after=60, clock=self.clock)
+        watch.observe(EXPIRED)
+        watch.observe("> all good\n")
+        self.clock.t += 120
+        self.assertFalse(watch.observe("> all good\n"))
+        self.assertEqual(len(calls), 1)
 
     def test_alert_text_tags_lucas_and_names_fix(self):
         text = alert_text("claudework", "LUCAS-PC")
