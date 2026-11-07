@@ -61,3 +61,21 @@ class ActivityTests(unittest.TestCase):
             self.assertTrue(checker())
             self.assertFalse(trigger[0])
             self.assertFalse(checker())
+
+
+class OnScreenTests(unittest.TestCase):
+    def test_on_screen_receives_pane_text(self):
+        seen = []
+        checker = get_activity_checker("test", provider="claude", on_screen=seen.append)
+        result = subprocess.CompletedProcess([], 0, stdout="⎿  Login expired · Please run /login\n".encode())
+        with patch("wrapper_unix.subprocess.run", return_value=result):
+            checker()
+        self.assertEqual(seen, ["⎿  Login expired · Please run /login\n"])
+
+    def test_on_screen_errors_do_not_break_activity(self):
+        def boom(_):
+            raise RuntimeError
+        checker = get_activity_checker("test", provider="claude", on_screen=boom)
+        frames = [subprocess.CompletedProcess([], 0, stdout=b"a"), subprocess.CompletedProcess([], 0, stdout=b"b")]
+        with patch("wrapper_unix.subprocess.run", side_effect=frames):
+            self.assertEqual([checker(), checker()], [False, True])

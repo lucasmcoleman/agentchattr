@@ -880,10 +880,30 @@ def main():
 
     _agent_pid = [None]
 
+    def _send_auth_alert():
+        # Tell the room (and Lucas) that this agent's CLI login expired.
+        import socket
+        from auth_watch import alert_text
+        current_name, _ = get_identity()
+        body = json.dumps({"text": alert_text(current_name, socket.gethostname()),
+                           "channel": "general"}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{server_port}/api/send", method="POST", data=body,
+            headers=_auth_headers(get_token(), include_json=True),
+        )
+        urllib.request.urlopen(req, timeout=5)
+        print(f"  Login expired: alerted the room for {current_name}")
+
+    from auth_watch import AuthExpiryWatch
+    _auth_watch = AuthExpiryWatch(_send_auth_alert)
+
     if sys.platform == "win32":
         from wrapper_windows import get_activity_checker, run_agent
 
-        _set_activity_checker(get_activity_checker(_agent_pid, agent_name=assigned_name, trigger_flag=_trigger_flag))
+        _set_activity_checker(get_activity_checker(
+            _agent_pid, agent_name=assigned_name, trigger_flag=_trigger_flag,
+            on_screen=_auth_watch.observe,
+        ))
     else:
         from wrapper_unix import get_activity_checker, run_agent
 
@@ -891,6 +911,7 @@ def main():
         _set_activity_checker(get_activity_checker(
             unix_session_name, trigger_flag=_trigger_flag,
             provider=_provider_from_command(command),
+            on_screen=_auth_watch.observe,
         ))
 
     run_kwargs = dict(

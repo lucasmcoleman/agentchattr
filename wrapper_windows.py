@@ -253,7 +253,7 @@ kernel32.ReadConsoleOutputW.argtypes = [
 kernel32.ReadConsoleOutputW.restype = wintypes.BOOL
 
 
-def get_activity_checker(pid_holder, agent_name="unknown", trigger_flag=None):
+def get_activity_checker(pid_holder, agent_name="unknown", trigger_flag=None, on_screen=None):
     """Return a callable that detects agent activity by diffing visible characters.
 
     Counts how many visible characters changed since last poll. Filters out
@@ -264,6 +264,7 @@ def get_activity_checker(pid_holder, agent_name="unknown", trigger_flag=None):
     trigger_flag: shared [bool] list — set to [True] by queue watcher when a
     message is injected. Forces active state immediately (covers thinking phase).
     pid_holder: not used for screen hashing, but kept for signature compatibility.
+    on_screen: optional callable given the visible screen text on every poll.
     """
     import array as _array
     import os as _os
@@ -324,6 +325,12 @@ def get_activity_checker(pid_holder, agent_name="unknown", trigger_flag=None):
                         n_changed += 1
         significant = n_changed >= MIN_CHANGED_CELLS
         last_chars[0] = char_data
+        if on_screen is not None:
+            try:
+                rows = char_data.decode("utf-16-le", errors="replace")
+                on_screen("\n".join(rows[i:i + width] for i in range(0, len(rows), width)))
+            except Exception:
+                pass
 
         # Hysteresis: active immediately on significant change or trigger,
         # idle only after IDLE_COOLDOWN consecutive quiet polls

@@ -156,8 +156,11 @@ def _without_codex_input_animation(output: bytes) -> bytes:
     return "\n".join(lines).encode("utf-8")
 
 
-def get_activity_checker(session_name, trigger_flag=None, *, provider=""):
-    """Return a callable that detects tmux pane output by hashing content."""
+def get_activity_checker(session_name, trigger_flag=None, *, provider="", on_screen=None):
+    """Return a callable that detects tmux pane output by hashing content.
+
+    on_screen: optional callable given the visible pane text on every poll.
+    """
     last_hash = [None]
 
     def check():
@@ -171,6 +174,11 @@ def get_activity_checker(session_name, trigger_flag=None, *, provider=""):
                 capture_output=True, timeout=2,
             )
             output = result.stdout
+            if on_screen is not None:
+                try:
+                    on_screen(output.decode("utf-8", errors="replace"))
+                except Exception:
+                    pass
             if provider == "codex":
                 output = _without_codex_input_animation(output)
             h = hash(output)
